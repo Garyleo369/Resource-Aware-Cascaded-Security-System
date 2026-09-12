@@ -1,0 +1,82 @@
+{
+  "timestamp": "2026-08-14T14:26:57",
+  "seed": 42,
+  "windows_per_scenario": 100,
+  "scenario_results": [
+    {
+      "scenario": "1 \u2014 Legitimate User (Normal Typing)",
+      "expected_outcome": "Session continues transparently, no lock",
+      "passed": true,
+      "false_lock": false,
+      "cv_trigger_rate": 0.0,
+      "total_windows": 100,
+      "anomaly_windows": 0,
+      "cv_triggers": 0,
+      "cv_fails": 0,
+      "mean_score": 0.20396699999999998,
+      "max_score": 0.5335
+    },
+    {
+      "scenario": "2 \u2014 Legitimate User (Behavioral Shift)",
+      "expected_outcome": "CV activates, confirms identity, session continues",
+      "passed": true,
+      "false_lock": false,
+      "cv_triggered_once": true,
+      "total_windows": 150,
+      "anomaly_windows": 4,
+      "cv_triggers": 1,
+      "cv_passes": 1,
+      "cv_fails": 0,
+      "mean_score": 0.42672199999999993,
+      "max_score": 0.8602
+    },
+    {
+      "scenario": "3 \u2014 Unauthorized User (Intruder)",
+      "expected_outcome": "Screen locked, security log generated",
+      "passed": true,
+      "correctly_locked": true,
+      "total_windows": 125,
+      "anomaly_windows": 3,
+      "cv_triggers": 1,
+      "cv_passes": 0,
+      "cv_fails": 1,
+      "mean_score": 0.6913503999999998,
+      "max_score": 0.8185
+    },
+    {
+      "scenario": "4 \u2014 Legitimate User (Extended Stability)",
+      "expected_outcome": "Lightweight retraining performed, session uninterrupted",
+      "passed": true,
+      "mean_score": 0.2014,
+      "stable_ratio": 0.8646,
+      "retraining_triggered": true,
+      "total_windows": 96,
+      "cv_triggers": 0
+    },
+    {
+      "scenario": "5 \u2014 Unauthorized User (CV Compound Confirmation)",
+      "expected_outcome": "Screen immediately locked, quiet security log entry",
+      "passed": true,
+      "correctly_locked": true,
+      "mean_intruder_score": 0.7539,
+      "total_windows": 125,
+      "anomaly_windows": 3,
+      "cv_triggers": 1,
+      "cv_fails": 1,
+      "mean_score": 0.6538792000000001,
+      "max_score": 0.7806
+    }
+  ],
+  "metrics": {
+    "TP": 2,
+    "TN": 3,
+    "FP": 0,
+    "FN": 0,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1_score": 1.0,
+    "FAR": 0.0,
+    "FRR": 0.0
+  }
+}

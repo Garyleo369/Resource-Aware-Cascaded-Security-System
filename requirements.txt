@@ -1,0 +1,12 @@
+pynput
+numpy
+scipy
+scikit-learn
+mediapipe==0.10.14
+opencv-python
+joblib
+pandas
+streamlit
+Pillow
+insightface
+onnxruntime

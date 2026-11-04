@@ -1,0 +1,75 @@
+{
+  "threshold_offset": 0.0,
+  "history": [
+    {
+      "recalibrated": false,
+      "old_offset": 0.0,
+      "new_offset": 0.0,
+      "verified_count": 1,
+      "score_at_trigger": 0.5521,
+      "message": "Verification PASSED \u2014 verified sample 1/30.  Need 29 more samples for recalibration.",
+      "timestamp": 1793592759.5515776,
+      "datetime": "2026-11-02 09:42:39"
+    },
+    {
+      "recalibrated": false,
+      "old_offset": 0.0,
+      "new_offset": 0.0,
+      "verified_count": 2,
+      "score_at_trigger": 0.5503,
+      "message": "Verification PASSED \u2014 verified sample 2/30.  Need 28 more samples for recalibration.",
+      "timestamp": 1793592965.1650357,
+      "datetime": "2026-11-02 09:46:05"
+    },
+    {
+      "recalibrated": false,
+      "old_offset": 0.0,
+      "new_offset": 0.0,
+      "verified_count": 3,
+      "score_at_trigger": 0.6749,
+      "message": "Verification PASSED \u2014 verified sample 3/30.  Need 27 more samples for recalibration.",
+      "timestamp": 1793593515.7581503,
+      "datetime": "2026-11-02 09:55:15"
+    },
+    {
+      "recalibrated": false,
+      "old_offset": 0.0,
+      "new_offset": 0.0,
+      "verified_count": 4,
+      "score_at_trigger": 0.6776,
+      "message": "Verification PASSED \u2014 verified sample 4/30.  Need 26 more samples for recalibration.",
+      "timestamp": 1793593772.3394656,
+      "datetime": "2026-11-02 09:59:32"
+    },
+    {
+      "recalibrated": false,
+      "old_offset": 0.0,
+      "new_offset": 0.0,
+      "verified_count": 5,
+      "score_at_trigger": 0.5414,
+      "message": "Verification PASSED \u2014 verified sample 5/30.  Need 25 more samples for recalibration.",
+      "timestamp": 1793594184.462972,
+      "datetime": "2026-11-02 10:06:24"
+    },
+    {
+      "recalibrated": false,
+      "old_offset": 0.0,
+      "new_offset": 0.0,
+      "verified_count": 1,
+      "score_at_trigger": 0.5386,
+      "message": "Verification PASSED \u2014 verified sample 1/30.  Need 29 more samples for recalibration.",
+      "timestamp": 1793612538.2846892,
+      "datetime": "2026-11-02 15:12:18"
+    },
+    {
+      "recalibrated": false,
+      "old_offset": 0.0,
+      "new_offset": 0.0,
+      "verified_count": 2,
+      "score_at_trigger": 0.5057,
+      "message": "Verification PASSED \u2014 verified sample 2/30.  Need 28 more samples for recalibration.",
+      "timestamp": 1793613057.2709908,
+      "datetime": "2026-11-02 15:20:57"
+    }
+  ]
+}

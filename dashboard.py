@@ -44,6 +44,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 V2_DIR          = os.path.join(os.path.dirname(__file__), "cascaded_auth")
 V2_MODEL_PATH   = os.path.join(V2_DIR, "model.joblib")
 V2_ENROL_VEC    = os.path.join(V2_DIR, "enrol_vectors.joblib")
+V2_FACE_PATH    = os.path.join(V2_DIR, "face_profile.joblib")
 V2_GAZE_PATH    = os.path.join(V2_DIR, "gaze_profile.joblib")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -341,97 +342,26 @@ def _frame_to_b64(frame: np.ndarray) -> str:
 
 def _run_cv_verification() -> dict:
     """
-    Capture a short webcam session, extract v2 MediaPipe gaze vectors, and compare
-    them against the enrolled cascaded_auth gaze profile.
+    Capture a short webcam session, extract 512-D ArcFace face embeddings,
+    and verify identity against the enrolled face profile using cosine distance.
     Returns a result dict (including a JPEG snapshot as base64).
     """
     try:
-        import joblib
-        from cascaded_auth.cv_check import (
-            MATCH_THRESHOLD,
-            PROFILE_FILE,
-            SESSION_SECS,
-            collect_gaze_vectors,
-        )
-    except ImportError as exc:
-        return {
-            "error": f"Import failed: {exc}", "match": False,
-            "combined": None, "gaze_dist": None, "geom_dist": None,
-            "timestamp": time.time(), "snapshot_b64": None,
-        }
-
-    # Grab a quick snapshot for the dashboard display
-    snapshot_b64 = None
-    raw_frame = _capture_frame()
-    if raw_frame is not None:
-        try:
-            snapshot_b64 = _frame_to_b64(raw_frame)
-        except Exception:
-            pass
-
-    if not os.path.exists(PROFILE_FILE):
-        return {
-            "error": "No v2 gaze profile found", "match": False,
-            "combined": None, "gaze_dist": None, "geom_dist": None,
-            "threshold": MATCH_THRESHOLD,
-            "timestamp": time.time(), "snapshot_b64": snapshot_b64,
-        }
-
-    try:
-        profile = joblib.load(PROFILE_FILE)
+        from cascaded_auth.cv_check import verify_face_session
+        return verify_face_session(duration_secs=3.0)
     except Exception as exc:
+        log.exception("Error during face verification: %s", exc)
         return {
-            "error": f"Failed to load v2 gaze profile: {exc}", "match": False,
-            "combined": None, "gaze_dist": None, "geom_dist": None,
-            "threshold": MATCH_THRESHOLD,
-            "timestamp": time.time(), "snapshot_b64": snapshot_b64,
+            "error": f"Face verification error: {exc}",
+            "match": False,
+            "combined": None,
+            "face_dist": None,
+            "gaze_dist": None,
+            "geom_dist": None,
+            "threshold": 0.50,
+            "timestamp": time.time(),
+            "snapshot_b64": None,
         }
-
-    vectors = collect_gaze_vectors(SESSION_SECS)
-    if not vectors:
-        return {
-            "error": "No face detected in camera", "match": False,
-            "combined": None, "gaze_dist": None, "geom_dist": None,
-            "threshold": MATCH_THRESHOLD,
-            "timestamp": time.time(), "snapshot_b64": snapshot_b64,
-        }
-
-    try:
-        session_vec = np.mean(np.array(vectors, dtype=np.float64), axis=0)
-        mean_vec = np.asarray(profile["mean"], dtype=np.float64)
-        cov = np.asarray(profile["cov"], dtype=np.float64)
-        try:
-            cov_inv = np.linalg.inv(cov)
-        except np.linalg.LinAlgError:
-            cov_inv = np.linalg.pinv(cov)
-    except Exception as exc:
-        return {
-            "error": f"Invalid v2 gaze profile: {exc}", "match": False,
-            "combined": None, "gaze_dist": None, "geom_dist": None,
-            "threshold": MATCH_THRESHOLD,
-            "timestamp": time.time(), "snapshot_b64": snapshot_b64,
-        }
-
-    try:
-        from scipy.spatial.distance import mahalanobis
-        dist = float(mahalanobis(session_vec, mean_vec, cov_inv))
-    except Exception:
-        diff = session_vec - mean_vec
-        dist = float(np.sqrt(diff @ diff))
-
-    match = dist < MATCH_THRESHOLD
-
-    return {
-        "match":        match,
-        "combined":     round(dist, 4),
-        "gaze_dist":    round(dist, 4),
-        "geom_dist":    None,
-        "threshold":    MATCH_THRESHOLD,
-        "n_frames":     len(vectors),
-        "timestamp":    time.time(),
-        "snapshot_b64": snapshot_b64,
-        "error":        None,
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -444,6 +374,7 @@ def _start_ksd_background() -> dict:
     Launch the cascaded_auth v2 KSD listener + scorer as a background daemon thread.
     """
     from cascaded_auth.ksd import KeystrokeBuffer, extract_features, AnomalyScorer
+    from cascaded_auth.recalibrator import VerificationGatedRecalibrator
     from pynput import keyboard
 
     # Thread-safe communication channels
@@ -474,7 +405,11 @@ def _start_ksd_background() -> dict:
     except FileNotFoundError:
         pass
 
-    live["_model_ref"] = scorer
+    # ── Verification-gated adaptive recalibrator ───────────────────────────
+    recalibrator = VerificationGatedRecalibrator(scorer)
+
+    live["_model_ref"]      = scorer
+    live["_recalibrator"]   = recalibrator
 
     def _worker():
         buffer = KeystrokeBuffer()
@@ -547,18 +482,32 @@ def _start_ksd_background() -> dict:
                         live["last_dwell_mean"]     = round(float(vec[0]),  2)
                         live["last_flight_mean"]    = round(float(vec[5]),  2)
 
+                    # ── Notify the recalibrator of this window ──────────────
+                    recalibrator.record_window(score, vec, triggered)
+
+                    # ── Apply temporal smoothing gate for CV triggering ──────
+                    fire_cv = recalibrator.should_fire_cv(score, triggered)
+
+                    # Expose recalibration state for the Streamlit UI
+                    live["recal_offset"]          = round(recalibrator.threshold_offset, 4)
+                    live["recal_verified_count"]  = recalibrator.verified_count
+                    live["recal_cooldown"]         = round(recalibrator.cooldown_remaining, 1)
+                    anom_c, anom_w                = recalibrator.anomaly_window_state
+                    live["recal_anomaly_window"]  = (anom_c, anom_w)
+
                     result_deque.append({
-                        "score":     round(score, 4),
-                        "threshold": round(thresh, 4),
-                        "triggered": triggered,
-                        "timestamp": ts,
+                        "score":         round(score, 4),
+                        "threshold":     round(thresh, 4),
+                        "triggered":     fire_cv,       # smoothed decision for CV gate
+                        "raw_triggered": triggered,     # raw IF decision
+                        "timestamp":     ts,
                     })
 
-                    _bg_append_ksd(score, triggered, ts)
+                    _bg_append_ksd(score, fire_cv, ts)
 
                     log.info(
-                        "[KSD-BG] score=%.4f  threshold=%.4f  triggered=%s  dim=%d",
-                        score, thresh, triggered, len(vec),
+                        "[KSD-BG] score=%.4f  threshold=%.4f  triggered=%s  fire_cv=%s  dim=%d",
+                        score, thresh, triggered, fire_cv, len(vec),
                     )
 
                 except Exception as _win_exc:
@@ -583,6 +532,7 @@ def _start_ksd_background() -> dict:
         "result_deque": result_deque,
         "live":         live,
         "stop_event":   stop_event,
+        "recalibrator": recalibrator,
     }
 
 
@@ -607,7 +557,19 @@ if "initialised" not in st.session_state:
     st.session_state.suspicion_active  = False   # True when KSD anomaly raised
     st.session_state.last_suspicion_ts = 0.0     # epoch of last suspicion raise
     st.session_state.last_cv_run_ts    = 0.0     # epoch of last CV run completion
+    # ── Recalibration state ────────────────────────────────────────────────
+    st.session_state.recal_history     = []      # displayed in UI; synced each tick
+    st.session_state.last_recal_entry  = None    # most recent recalibration result
+    # ── Recalibration state ────────────────────────────────────────────────
+    st.session_state.recal_history     = []      # displayed in UI; synced each tick
+    st.session_state.last_recal_entry  = None    # most recent recalibration result
     st.session_state.initialised       = True
+
+# ── Guard: ensure recal keys exist (handles old sessions before this update) ──
+if "recal_history" not in st.session_state:
+    st.session_state.recal_history = []
+if "last_recal_entry" not in st.session_state:
+    st.session_state.last_recal_entry = None
 
 # ── Start (or retrieve cached) background KSD thread ──────────────────────────
 ksd_bg = _start_ksd_background()
@@ -625,7 +587,7 @@ with st.sidebar:
     st.markdown("---")
 
     model_ok   = os.path.exists(V2_MODEL_PATH)
-    profile_ok = os.path.exists(V2_GAZE_PATH)
+    profile_ok = os.path.exists(V2_FACE_PATH) or os.path.exists(V2_GAZE_PATH)
 
     st.markdown("### System Readiness")
     st.markdown(
@@ -633,7 +595,7 @@ with st.sidebar:
         f"({'enrolled' if model_ok else 'use Enrolment'})"
     )
     st.markdown(
-        f"{'✅' if profile_ok else '❌'} **Gaze Profile** "
+        f"{'✅' if profile_ok else '❌'} **Face Profile** "
         f"({'enrolled' if profile_ok else 'use Enrolment'})"
     )
     if not (model_ok and profile_ok):
@@ -674,6 +636,45 @@ with st.sidebar:
     st.markdown("🔴 **FAIL** — possible impostor")
     st.markdown("🚨 **ANOMALY** — CV triggered")
     st.markdown("---")
+    st.markdown("### 📥 Documentation")
+    
+    # SYSTEM_REFERENCE.md
+    sys_md_path = os.path.join(os.path.dirname(__file__), "SYSTEM_REFERENCE.md")
+    if os.path.exists(sys_md_path):
+        with open(sys_md_path, "r", encoding="utf-8") as _f:
+            st.download_button(
+                label="📄 System Reference (.md)",
+                data=_f.read(),
+                file_name="SYSTEM_REFERENCE.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+            
+    # SYSTEM_REFERENCE.docx
+    sys_docx_path = os.path.join(os.path.dirname(__file__), "SYSTEM_REFERENCE.docx")
+    if os.path.exists(sys_docx_path):
+        with open(sys_docx_path, "rb") as _f:
+            st.download_button(
+                label="📘 System Reference (.docx)",
+                data=_f.read(),
+                file_name="SYSTEM_REFERENCE.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+
+    # PROJECT_REPORT.docx
+    rep_docx_path = os.path.join(os.path.dirname(__file__), "PROJECT_REPORT.docx")
+    if os.path.exists(rep_docx_path):
+        with open(rep_docx_path, "rb") as _f:
+            st.download_button(
+                label="📑 Project Report (.docx)",
+                data=_f.read(),
+                file_name="PROJECT_REPORT.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+
+    st.markdown("---")
     st.caption("Two-Tier Auth Prototype · KSD v2")
 
 
@@ -693,7 +694,7 @@ if app_mode == "Enrolment":
     st.markdown("# 📝 Enrolment — Cascaded Auth")
     st.markdown(
         "Build the **v2 keystroke baseline** (12-D feature vector, "
-        "K=2.5, FLOOR=0.60, consecutive-anomaly buffer=3) and the **MediaPipe gaze profile** "
+        "K=2.5, FLOOR=0.60, consecutive-anomaly buffer=3) and the **ArcFace face profile (512-D)** "
         "used by `cascaded_auth/monitor.py`."
     )
 
@@ -747,12 +748,12 @@ if app_mode == "Enrolment":
     # ── Readiness badges ──────────────────────────────────────────────────────
     _v2r1, _v2r2, _v2r3 = st.columns(3)
     _v2_ksd_ok  = os.path.exists(V2_MODEL_PATH)
-    _v2_gaze_ok = os.path.exists(V2_GAZE_PATH)
+    _v2_face_ok = os.path.exists(V2_FACE_PATH) or os.path.exists(V2_GAZE_PATH)
 
     for _col, _ok, _label, _detail in [
         (_v2r1, _v2_ksd_ok,  "KSD Model",    "model.joblib"),
-        (_v2r2, _v2_gaze_ok, "Gaze Profile",  "gaze_profile.joblib"),
-        (_v2r3, _v2_ksd_ok and _v2_gaze_ok, "System", "Ready" if (_v2_ksd_ok and _v2_gaze_ok) else "Incomplete"),
+        (_v2r2, _v2_face_ok, "Face Profile", "face_profile.joblib"),
+        (_v2r3, _v2_ksd_ok and _v2_face_ok, "System", "Ready" if (_v2_ksd_ok and _v2_face_ok) else "Incomplete"),
     ]:
         _c = "#3fb950" if _ok else "#f85149"
         _i = "✅" if _ok else "❌"
@@ -771,86 +772,80 @@ if app_mode == "Enrolment":
     _v2_col_gaze, _v2_col_ksd = st.columns(2, gap="large")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Left column — Gaze Profile (MediaPipe)
+    # Left column — Face Profile (InsightFace ArcFace)
     # ─────────────────────────────────────────────────────────────────────────
     with _v2_col_gaze:
-        st.markdown("### 👁 Gaze Profile (MediaPipe)")
+        st.markdown("### 👤 Face Profile (ArcFace)")
         st.markdown(
-            "Sit naturally in front of the webcam. The system captures "
-            "**30 seconds** of MediaPipe iris gaze vectors and saves a "
-            "Mahalanobis distance profile used by `cv_check.py`."
+            "Sit naturally facing the webcam. The system captures "
+            "**deep face embeddings (512-D ArcFace)** using InsightFace and saves an "
+            "identity profile used for Tier-2 biometric face verification."
         )
         st.markdown(
             '<ol style="color:#8b949e;font-size:0.88rem;line-height:1.9;padding-left:18px;margin-top:8px;">'
-            '<li>Position your face in the webcam</li>'
-            '<li>Click <strong style="color:#e6edf3;">Start 30 s Gaze Capture</strong></li>'
-            '<li>Look naturally at the screen for 30 seconds</li>'
-            '<li>Done — profile saved automatically</li>'
+            '<li>Position your face clearly in the webcam</li>'
+            '<li>Click <strong style="color:#e6edf3;">Start 10 s Face Capture</strong></li>'
+            '<li>Look naturally at the camera while embeddings are extracted</li>'
+            '<li>Done — identity profile saved automatically</li>'
             '</ol>',
             unsafe_allow_html=True,
         )
 
-        if _v2_gaze_ok:
+        if _v2_face_ok:
             try:
                 import joblib as _jl_g
-                _gp = _jl_g.load(V2_GAZE_PATH)
+                _active_path = V2_FACE_PATH if os.path.exists(V2_FACE_PATH) else V2_GAZE_PATH
+                _fp = _jl_g.load(_active_path)
+                _fn = _fp.get("n_frames", _fp.get("n", "?"))
+                _fm = _fp.get("model", "ArcFace 512-D")
                 st.markdown(
                     f'<div style="background:#0d2b1a;border:1px solid #3fb950;border-radius:8px;'
                     f'padding:10px 14px;font-size:0.83rem;color:#7ee2a8;margin-bottom:10px;">'
-                    f'✅ Gaze profile on disk · {_gp.get("n", "?")} frames</div>',
+                    f'✅ Face profile on disk · {_fn} frames ({_fm})</div>',
                     unsafe_allow_html=True,
                 )
             except Exception:
                 pass
 
-        if st.button("👁 Start 30 s Gaze Capture", use_container_width=True, key="v2_gaze_btn"):
+        if st.button("👤 Start 10 s Face Capture", use_container_width=True, key="v2_face_btn"):
             try:
-                from cascaded_auth.cv_check import collect_gaze_vectors, save_gaze_profile
-                _gaze_prog = st.progress(0.0, text="Opening webcam…")
-                _gaze_info = st.info("Look at the screen naturally for 30 seconds…")
+                from cascaded_auth.cv_check import extract_face_embedding, save_face_profile
+                _face_prog = st.progress(0.0, text="Opening webcam…")
+                _face_info = st.info("Look naturally at the webcam for 10 seconds…")
 
                 import cv2 as _cv2_g
-                import mediapipe as _mp_g
 
-                _mp_face_g = _mp_g.solutions.face_mesh
                 _cap_g     = _cv2_g.VideoCapture(0)
                 _vecs_g    = []
-                _end_g     = time.time() + 30.0
+                _end_g     = time.time() + 10.0
                 _ph_g      = st.empty()
 
-                with _mp_face_g.FaceMesh(refine_landmarks=True, max_num_faces=1) as _mesh_g:
-                    while time.time() < _end_g:
-                        _ok_g, _fr_g = _cap_g.read()
-                        if not _ok_g:
-                            continue
-                        _h_g, _w_g = _fr_g.shape[:2]
-                        _rgb_g = _cv2_g.cvtColor(_fr_g, _cv2_g.COLOR_BGR2RGB)
-                        _res_g = _mesh_g.process(_rgb_g)
-                        if _res_g.multi_face_landmarks:
-                            from cascaded_auth.cv_check import get_gaze_vector
-                            _vv = get_gaze_vector(_res_g.multi_face_landmarks[0], _w_g, _h_g)
-                            _vecs_g.append(_vv)
-                        _rem_g = max(0, _end_g - time.time())
-                        _pct_g = min(1.0, 1.0 - _rem_g / 30.0)
-                        _gaze_prog.progress(_pct_g, text=f"{len(_vecs_g)} frames | {_rem_g:.0f}s remaining")
-                        _ph_g.image(_fr_g, channels="BGR")
+                while time.time() < _end_g:
+                    _ok_g, _fr_g = _cap_g.read()
+                    if not _ok_g:
+                        continue
+                    _emb_g = extract_face_embedding(_fr_g)
+                    if _emb_g is not None:
+                        _vecs_g.append(_emb_g)
+                    _rem_g = max(0, _end_g - time.time())
+                    _pct_g = min(1.0, 1.0 - _rem_g / 10.0)
+                    _face_prog.progress(_pct_g, text=f"{len(_vecs_g)} face embeddings | {_rem_g:.0f}s remaining")
+                    _ph_g.image(_fr_g, channels="BGR")
 
                 _cap_g.release()
                 _ph_g.empty()
-                _gaze_prog.empty()
-                _gaze_info.empty()
+                _face_prog.empty()
+                _face_info.empty()
 
                 if not _vecs_g:
-                    st.error("❌ No face detected — check webcam and try again.")
+                    st.error("❌ No face detected — check webcam lighting and try again.")
                 else:
-                    save_gaze_profile(_vecs_g)
-                    st.success(f"✅ Gaze profile saved! · {len(_vecs_g)} frames")
+                    save_face_profile(_vecs_g)
+                    st.success(f"✅ Face profile saved! · {len(_vecs_g)} ArcFace embeddings")
                     st.rerun()
 
-            except ImportError as _gimp:
-                st.error(f"❌ Import error: {_gimp}. Ensure mediapipe is installed.")
-            except Exception as _ge:
-                st.error(f"❌ Gaze capture failed: {_ge}")
+            except Exception as _fe:
+                st.error(f"❌ Face capture failed: {_fe}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Right column — KSD Enrolment
@@ -1202,16 +1197,32 @@ elif st.session_state.suspicion_active:
 # ══════════════════════════════════════════════════════════════════════════════
 
 cv_result_this_tick = None
+_recalibrator       = ksd_bg.get("recalibrator")   # may be None on first start
 
 if cv_triggered and not st.session_state.cv_running:
     if profile_ok:
         st.session_state.cv_running = True
+        # Notify the recalibrator that a CV check is starting so it does not
+        # allow a second check to be fired from the background thread concurrently.
+        if _recalibrator is not None:
+            _recalibrator.mark_cv_started()
         with st.spinner("📷 Suspicious keystroke pattern — activating camera for identity check…"):
             cv_result_this_tick = _run_cv_verification()
         st.session_state.cv_running = False
         st.session_state.last_cv_run_ts = time.time()
+
+        # ── Feed the CV result into the recalibrator ──────────────────────
+        if _recalibrator is not None and cv_result_this_tick:
+            _score_at_trigger = live.get("last_score")
+            recal_entry = _recalibrator.on_cv_result(
+                matched=bool(cv_result_this_tick.get("match")),
+                score_at_trigger=_score_at_trigger,
+            )
+            st.session_state.last_recal_entry = recal_entry
+            # Refresh history from the recalibrator
+            st.session_state.recal_history = _recalibrator.history
     else:
-        st.warning("⚠️ CV skipped — complete Enrolment to create a v2 gaze profile.")
+        st.warning("⚠️ CV skipped — complete Enrolment to create a face profile.")
 
     if cv_result_this_tick:
         with _LOG_LOCK:
@@ -1236,6 +1247,10 @@ if not cv_result_this_tick:
                 st.session_state.cv_results = disk_cv[-20:]
     except Exception:
         pass
+
+# ── Sync recalibration history from the live recalibrator each tick ───────────
+if _recalibrator is not None:
+    st.session_state.recal_history = _recalibrator.history
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1546,7 +1561,15 @@ display_thr = last_bg_thr if last_bg_thr is not None else (thr if thr else None)
 with col1:
     st.metric("Latest KSD Score", f"{display_score:.4f}")
 with col2:
-    st.metric("Dynamic Threshold", f"{display_thr:.4f}" if display_thr else "—")
+    # Show the effective threshold (base + adaptive offset) when available
+    _disp_offset = live.get("recal_offset", 0.0) or 0.0
+    _disp_eff_thr = (
+        round((display_thr or 0.0) + _disp_offset, 4)
+        if display_thr is not None else None
+    )
+    _thr_label = f"{_disp_eff_thr:.4f}" if _disp_eff_thr is not None else "—"
+    _thr_delta = f"offset {_disp_offset:+.4f}" if _disp_offset != 0 else None
+    st.metric("Effective Threshold", _thr_label, delta=_thr_delta)
 with col3:
     st.metric("CV Triggers",
               st.session_state.trigger_count,
@@ -1597,6 +1620,16 @@ if len(st.session_state.ksd_scores) > 0:
                 name="Dynamic Threshold",
                 line=dict(color="#f0883e", width=2, dash="dash"),
             ))
+            # ── Effective threshold (base + adaptive offset) ───────────────
+            _chart_offset = live.get("recal_offset", 0.0) or 0.0
+            if _chart_offset != 0.0:
+                _eff_arr = [round(th + _chart_offset, 4) for th in t_arr]
+                fig.add_trace(go.Scatter(
+                    x=x_t, y=_eff_arr,
+                    mode="lines",
+                    name="Effective Threshold (+ offset)",
+                    line=dict(color="#a5d6a7", width=1.5, dash="dot"),
+                ))
             breach_pairs = [(x_t[i], s) for i, (s, th) in
                             enumerate(zip(s_arr[-len(t_arr):], t_arr)) if s > th]
             breach_x = [p[0] for p in breach_pairs]
@@ -1643,25 +1676,25 @@ if cv_result_this_tick:
             <div class="alert-detail">{err}</div>
         </div>""", unsafe_allow_html=True)
     elif matched:
+        _dist_val = cv_result_this_tick.get('face_dist', cv_result_this_tick.get('combined', cv_result_this_tick.get('gaze_dist')))
         st.markdown(f"""
         <div class="alert-pass">
             <div class="alert-title">✅ IDENTITY CONFIRMED</div>
             <div class="alert-detail">
-                Combined: {cv_result_this_tick['combined']} &nbsp;|&nbsp;
-                Gaze dist: {cv_result_this_tick['gaze_dist']} &nbsp;|&nbsp;
-                Geom dist: {cv_result_this_tick['geom_dist']} &nbsp;|&nbsp;
-                Threshold: {cv_result_this_tick.get('threshold', 3.5)}
+                Face Distance (Cosine): {_dist_val} &nbsp;|&nbsp;
+                Threshold: {cv_result_this_tick.get('threshold', 0.50)} &nbsp;|&nbsp;
+                Frames: {cv_result_this_tick.get('n_frames', '—')}
             </div>
         </div>""", unsafe_allow_html=True)
     else:
+        _dist_val = cv_result_this_tick.get('face_dist', cv_result_this_tick.get('combined', cv_result_this_tick.get('gaze_dist')))
         st.markdown(f"""
         <div class="alert-fail">
             <div class="alert-title">🚨 VERIFICATION FAILED — POSSIBLE IMPOSTOR</div>
             <div class="alert-detail">
-                Combined: {cv_result_this_tick['combined']} &nbsp;|&nbsp;
-                Gaze dist: {cv_result_this_tick['gaze_dist']} &nbsp;|&nbsp;
-                Geom dist: {cv_result_this_tick['geom_dist']} &nbsp;|&nbsp;
-                Threshold: {cv_result_this_tick.get('threshold', 3.5)}
+                Face Distance (Cosine): {_dist_val} &nbsp;|&nbsp;
+                Threshold: {cv_result_this_tick.get('threshold', 0.50)} &nbsp;|&nbsp;
+                Frames: {cv_result_this_tick.get('n_frames', '—')}
             </div>
         </div>""", unsafe_allow_html=True)
 
@@ -1672,15 +1705,15 @@ with cv_col1:
         df_cv = pd.DataFrame(st.session_state.cv_results[-20:])
         df_cv["time"]   = pd.to_datetime(df_cv["timestamp"], unit="s")
         df_cv["status"] = df_cv["match"].map({True: "✅ PASS", False: "❌ FAIL"})
-        cols_want  = ["time", "status", "gaze_dist", "geom_dist", "combined"]
+        cols_want  = ["time", "status", "face_dist", "combined", "gaze_dist"]
         cols_avail = [c for c in cols_want if c in df_cv.columns]
         st.dataframe(
             df_cv[cols_avail].rename(columns={
                 "time":      "Timestamp",
                 "status":    "Decision",
-                "gaze_dist": "Gaze Dist",
-                "geom_dist": "Geom Dist",
+                "face_dist": "Face Dist",
                 "combined":  "Combined",
+                "gaze_dist": "Legacy Dist",
             }),
             use_container_width=True,
             hide_index=True,
@@ -1697,13 +1730,13 @@ with cv_col2:
                     unsafe_allow_html=True)
         st.markdown("")
         for label, key in [
-            ("Gaze Distance", "gaze_dist"),
-            ("Geom Distance", "geom_dist"),
-            ("Combined",      "combined"),
+            ("Face Distance (Cosine)", "face_dist"),
+            ("Combined Distance",      "combined"),
+            ("Legacy Gaze Dist",       "gaze_dist"),
         ]:
             if last.get(key) is not None:
                 st.markdown(f"**{label}:** `{last[key]}`")
-        st.markdown(f"**Threshold:** `{last.get('threshold', 3.5)}`")
+        st.markdown(f"**Threshold:** `{last.get('threshold', 0.50)}`")
         if ts := last.get("timestamp"):
             st.markdown(f"**Time:** {datetime.fromtimestamp(ts).strftime('%H:%M:%S')}")
         if snap := last.get("snapshot_b64"):
@@ -1732,6 +1765,161 @@ if len(scores) >= 2:
     stat_cols[1].metric("Std Dev",    f"{scores.std():.4f}")
     stat_cols[2].metric("Min Score",  f"{scores.min():.4f}")
     stat_cols[3].metric("Max Score",  f"{scores.max():.4f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔄 Adaptive KSD Recalibration Panel
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.markdown("## 🔄 Adaptive KSD Recalibration")
+st.markdown(
+    "Verification-gated threshold recalibration — the threshold only shifts "
+    "after face verification **PASSES**, using the genuine owner's confirmed "
+    "typing samples. Unverified windows never influence the model."
+)
+
+# ── Pull live recalibration state from the background thread ──────────────────
+_recal_offset   = live.get("recal_offset", 0.0) or 0.0
+_recal_verified = live.get("recal_verified_count", 0) or 0
+_recal_cooldown = live.get("recal_cooldown", 0.0) or 0.0
+_recal_anom_win = live.get("recal_anomaly_window", (0, 3)) or (0, 3)
+
+from cascaded_auth.recalibrator import (
+    MIN_VERIFIED_SAMPLES, MAX_DELTA, FLOOR_BOUND, CEIL_BOUND,
+    ANOMALY_WINDOW, ANOMALY_COUNT, HIGH_RISK_THRESHOLD,
+    POST_VERIFY_COOLDOWN_S,
+)
+
+_effective_thr = (
+    round((last_bg_thr or 0.0) + _recal_offset, 4)
+    if last_bg_thr is not None
+    else None
+)
+
+# ── Status KPIs ───────────────────────────────────────────────────────────────
+_r1, _r2, _r3, _r4 = st.columns(4)
+
+with _r1:
+    _offset_delta_str = f"{_recal_offset:+.4f}" if _recal_offset != 0 else "none"
+    st.metric(
+        "Threshold Offset",
+        f"{_recal_offset:+.4f}",
+        help="Adaptive shift applied to the dynamic threshold. Bounded to ±0.15.",
+    )
+
+with _r2:
+    st.metric(
+        "Effective Threshold",
+        f"{_effective_thr:.4f}" if _effective_thr is not None else "—",
+        help="Dynamic threshold + adaptive offset. This is the actual decision boundary.",
+    )
+
+with _r3:
+    st.metric(
+        "Verified Samples",
+        f"{_recal_verified} / {MIN_VERIFIED_SAMPLES}",
+        help=f"Accumulating verified typing samples. Recalibration fires at {MIN_VERIFIED_SAMPLES}.",
+    )
+
+with _r4:
+    _cooldown_txt = f"{_recal_cooldown:.0f} s" if _recal_cooldown > 0 else "Ready ✅"
+    st.metric(
+        "CV Cooldown",
+        _cooldown_txt,
+        help="Remaining post-verification cooldown before auto-CV can fire again.",
+    )
+
+# ── Temporal smoothing status ─────────────────────────────────────────────────
+_anom_c, _anom_w = _recal_anom_win
+_smoothing_pct    = min(_anom_c / max(ANOMALY_COUNT, 1), 1.0)
+_smoothing_color  = "#f85149" if _anom_c >= ANOMALY_COUNT else (
+                        "#f0883e" if _anom_c > 0 else "#3fb950"
+                    )
+_smoothing_label  = (
+    f"🚨 CV TRIGGER ({_anom_c}/{ANOMALY_COUNT} in last {_anom_w} windows)"
+    if _anom_c >= ANOMALY_COUNT
+    else f"🟡 {_anom_c}/{ANOMALY_COUNT} anomalies in last {_anom_w} windows"
+    if _anom_c > 0
+    else f"✅ No anomalies in last {_anom_w} windows"
+)
+st.markdown(
+    f'<div style="background:#161b22;border:1px solid {_smoothing_color};border-radius:10px;'
+    f'padding:12px 18px;margin:10px 0;">'
+    f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;'
+    f'letter-spacing:0.06em;margin-bottom:6px;">Temporal Smoothing Gate '
+    f'(need {ANOMALY_COUNT} of {_anom_w} windows to fire CV)</div>'
+    f'<div style="color:{_smoothing_color};font-weight:700;font-size:0.95rem;">{_smoothing_label}</div>'
+    f'<div style="background:#21262d;height:8px;border-radius:4px;margin-top:8px;overflow:hidden;">'
+    f'<div style="width:{int(_smoothing_pct*100)}%;height:100%;'
+    f'background:{_smoothing_color};border-radius:4px;transition:width 0.3s;"></div></div>'
+    f'<div style="color:#8b949e;font-size:0.75rem;margin-top:6px;">'
+    f'High-risk scores (&gt; {HIGH_RISK_THRESHOLD}) always bypass smoothing · '
+    f'Post-verification cooldown: {POST_VERIFY_COOLDOWN_S:.0f} s</div>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
+
+# ── Last recalibration result ─────────────────────────────────────────────────
+_last_recal = st.session_state.last_recal_entry
+if _last_recal:
+    _was_recal = _last_recal.get("recalibrated", False)
+    _recal_bg  = "#0d2b1a" if _was_recal else "#1a1a2e"
+    _recal_brd = "#3fb950" if _was_recal else "#58a6ff"
+    _recal_ico = "✅" if _was_recal else "ℹ️"
+    st.markdown(
+        f'<div style="background:{_recal_bg};border:1px solid {_recal_brd};'
+        f'border-radius:10px;padding:14px 18px;margin:10px 0;">'
+        f'<div style="color:{_recal_brd};font-weight:700;margin-bottom:4px;">'
+        f'{_recal_ico} Last Recalibration Event</div>'
+        f'<div style="color:#c9d1d9;font-size:0.88rem;line-height:1.7;">'
+        f'{_last_recal.get("message", "—")}<br>'
+        f'<span style="color:#8b949e;font-size:0.78rem;">'
+        f'Offset: {_last_recal.get("old_offset", 0):+.4f} → {_last_recal.get("new_offset", 0):+.4f} · '
+        f'Score at trigger: {_last_recal.get("score_at_trigger") or "—"} · '
+        f'{_last_recal.get("datetime", "")}'
+        f'</span></div></div>',
+        unsafe_allow_html=True,
+    )
+
+# ── Recalibration history table ───────────────────────────────────────────────
+_recal_hist = st.session_state.recal_history
+if _recal_hist:
+    with st.expander(f"📋 Recalibration History ({len(_recal_hist)} events)", expanded=False):
+        _hist_rows = []
+        for _h in reversed(_recal_hist[-50:]):
+            _hist_rows.append({
+                "Time":            _h.get("datetime", ""),
+                "Verified Count":  _h.get("verified_count", "—"),
+                "Old Offset":      f"{_h.get('old_offset', 0):+.4f}",
+                "New Offset":      f"{_h.get('new_offset', 0):+.4f}",
+                "Recalibrated":    "✅ Yes" if _h.get("recalibrated") else "—",
+                "Score@Trigger":   _h.get("score_at_trigger") or "—",
+                "Notes":           _h.get("message", "")[:80],
+            })
+        st.dataframe(
+            pd.DataFrame(_hist_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+else:
+    st.info(
+        "No recalibration events yet. "
+        "Events are recorded after each face verification (pass or fail)."
+    )
+
+# ── Configuration reference ───────────────────────────────────────────────────
+with st.expander("⚙️ Recalibration Configuration", expanded=False):
+    _cfg_cols = st.columns(4)
+    _cfg_cols[0].metric("Min Verified Samples", MIN_VERIFIED_SAMPLES)
+    _cfg_cols[1].metric("Max Δ per Update",      f"±{MAX_DELTA}")
+    _cfg_cols[2].metric("Offset Bounds",          f"[{FLOOR_BOUND}, +{CEIL_BOUND}]")
+    _cfg_cols[3].metric("High-Risk Bypass",       f"> {HIGH_RISK_THRESHOLD}")
+    st.caption(
+        f"Temporal smoothing: {ANOMALY_COUNT} anomalies in {ANOMALY_WINDOW} windows · "
+        f"Post-verification cooldown: {POST_VERIFY_COOLDOWN_S:.0f} s · "
+        f"Constants in `cascaded_auth/recalibrator.py`"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

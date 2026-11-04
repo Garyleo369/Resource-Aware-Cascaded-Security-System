@@ -26,7 +26,14 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cascaded_auth.ksd      import KeystrokeBuffer, AnomalyScorer, extract_features, WINDOW
-from cascaded_auth.cv_check import collect_gaze_vectors, save_gaze_profile
+from cascaded_auth.cv_check import (
+    collect_face_embeddings,
+    save_face_profile,
+    FACE_PROFILE_FILE,
+    # Backward compatibility aliases
+    collect_gaze_vectors,
+    save_gaze_profile,
+)
 
 try:
     from pynput import keyboard
@@ -36,7 +43,8 @@ except ImportError:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 ENROL_SECS  = 900    # 15 minutes (Fix 1)
-GAZE_SECS   = 30     # gaze capture after keystroke enrolment
+FACE_SECS   = 10     # face capture duration (ArcFace 512-D embeddings)
+GAZE_SECS   = FACE_SECS
 # ── Point 1: 50 windows required for a reliable IsolationForest baseline.
 # With fewer samples the model scores everything as anomalous (normalised
 # score ≈ 1.0), causing the dynamic threshold to saturate so no intruder
@@ -141,16 +149,16 @@ def enrol() -> None:
         print(f"     Re-run and type for longer (current: {len(X)} windows, target: 100+).")
     print("  " + "-" * 50)
 
-    # ── Gaze profile ──────────────────────────────────────────────────────────
-    print(f"\nCollecting gaze profile ({GAZE_SECS} s — look at the screen normally)...")
-    gaze_vecs = collect_gaze_vectors(GAZE_SECS)
+    # ── Face Profile (ArcFace) ────────────────────────────────────────────────
+    print(f"\nCollecting face profile ({FACE_SECS} s — look at the webcam normally)...")
+    face_vecs, _ = collect_face_embeddings(FACE_SECS)
 
-    if not gaze_vecs:
-        print("  ✗ No face detected — gaze profile NOT saved.")
+    if not face_vecs:
+        print("  ✗ No face detected — face profile NOT saved.")
         print("    Make sure your webcam is connected and your face is visible.")
     else:
-        save_gaze_profile(gaze_vecs)
-        print(f"  ✓ Gaze profile saved → cascaded_auth/gaze_profile.joblib")
+        save_face_profile(face_vecs)
+        print(f"  ✓ Face profile saved → cascaded_auth/face_profile.joblib")
 
     print("\nEnrolment complete.  Run cascaded_auth/monitor.py to start monitoring.")
     print("=" * 60)

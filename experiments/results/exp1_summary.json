@@ -1,0 +1,101 @@
+{
+  "experiment": "1 \u2014 KSD Anomaly Detection Performance",
+  "config": {
+    "feature_dim": 12,
+    "feature_names": [
+      "dwell_mean",
+      "dwell_std",
+      "dwell_p10",
+      "dwell_p50",
+      "dwell_p90",
+      "flight_mean",
+      "flight_std",
+      "flight_p10",
+      "flight_p50",
+      "flight_p90",
+      "typing_rate",
+      "burst_ratio"
+    ],
+    "model": "IsolationForest",
+    "n_estimators": 200,
+    "contamination": 0.02,
+    "random_state": 42,
+    "window_size_keys": 25,
+    "K": 1.2,
+    "FLOOR": 0.45,
+    "ROLLING_N": 20,
+    "threshold_formula": "max(median(last_N_scores) + K * std(last_N_scores), FLOOR)",
+    "warm_up_windows": 3,
+    "warm_up_threshold": 0.55,
+    "warm_up_cap": 0.5,
+    "seed": 42,
+    "n_genuine": 200,
+    "n_impostor": 200,
+    "n_enrol": 11
+  },
+  "model_health": {
+    "enrol_score_mean": 0.1562,
+    "enrol_score_max": 0.5865,
+    "rating": "GOOD",
+    "model_offset": -0.661241
+  },
+  "score_distributions": {
+    "genuine": {
+      "mean": 0.1606,
+      "std": 0.1216,
+      "min": 0.0716,
+      "max": 0.6029,
+      "p10": 0.0893,
+      "p50": 0.1289,
+      "p90": 0.1976
+    },
+    "impostor": {
+      "mean": 0.3003,
+      "std": 0.0116,
+      "min": 0.235,
+      "max": 0.3123,
+      "p10": 0.2927,
+      "p50": 0.3015,
+      "p90": 0.3058
+    }
+  },
+  "operational_threshold": 0.45,
+  "metrics_at_operational": {
+    "TP": 0,
+    "TN": 184,
+    "FP": 16,
+    "FN": 200,
+    "TPR": 0.0,
+    "FPR": 0.08,
+    "precision": 0.0,
+    "F1": 0.0,
+    "FAR": 0.08,
+    "FRR": 1.0,
+    "accuracy": 0.46,
+    "threshold": 0.45,
+    "n_samples": 400,
+    "n_genuine": 200,
+    "n_impostor": 200
+  },
+  "metrics_at_floor": {
+    "TP": 0,
+    "TN": 184,
+    "FP": 16,
+    "FN": 200,
+    "TPR": 0.0,
+    "FPR": 0.08,
+    "precision": 0.0,
+    "F1": 0.0,
+    "FAR": 0.08,
+    "FRR": 1.0,
+    "accuracy": 0.46,
+    "threshold": 0.45,
+    "n_samples": 400,
+    "n_genuine": 200,
+    "n_impostor": 200
+  },
+  "roc_auc": 0.92,
+  "eer": 0.08,
+  "eer_threshold": 0.2897,
+  "detection_latency_ms": 12.0573
+}

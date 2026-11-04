@@ -175,6 +175,10 @@ class AnomalyScorer:
         self.model: IsolationForest | None = None
         self.scores: collections.deque     = collections.deque(maxlen=ROLLING_N)
         self.confirmed_windows: list       = []   # CV-confirmed vecs for recal
+        # ── Adaptive recalibration offset (set by VerificationGatedRecalibrator) ──
+        # Added to the dynamic threshold computed by threshold().  Bounded to
+        # ±0.15 by the recalibrator; default 0.0 means no change from baseline.
+        self.threshold_offset: float       = 0.0
 
     # ── Model lifecycle ───────────────────────────────────────────────────────
 
@@ -248,7 +252,10 @@ class AnomalyScorer:
         Compute the current detection threshold.
 
         During warm-up (fewer than 3 scored windows) returns 0.55.
-        Otherwise: max(median + K * std, FLOOR).
+        Otherwise: max(median + K * std, FLOOR) + threshold_offset.
+
+        ``threshold_offset`` is set by the VerificationGatedRecalibrator and
+        bounded to ±0.15 so the effective threshold cannot drift dangerously.
         """
         if len(self.scores) < 3:
             return 0.55   # warm-up fallback — lower than before for faster sensitisation
@@ -257,7 +264,9 @@ class AnomalyScorer:
         # Use median instead of mean — robust against outlier sessions
         # inflating the baseline and pushing the threshold too high.
         dynamic = float(np.median(arr) + K * np.std(arr))
-        return max(dynamic, FLOOR)
+        base    = max(dynamic, FLOOR)
+        # Apply the adaptive offset (bounded externally by the recalibrator).
+        return float(np.clip(base + self.threshold_offset, FLOOR, 1.0))
 
     def is_anomaly(self, score: float) -> bool:
         """Return True if score exceeds the current threshold."""

@@ -1,231 +1,368 @@
 """
-cascaded_auth/cv_check.py — Webcam identity verification for Prototype v2.
+cascaded_auth/cv_check.py — Deep Face Identity Verification for Prototype v2.
 
-Uses MediaPipe FaceMesh iris landmarks to build a 4-D normalised gaze vector
-per frame, then compares the session mean against the enrolled profile using
-Mahalanobis distance.
+Upgraded from iris-gaze tracking to deep facial recognition using InsightFace
+ArcFace (512-dimensional identity embeddings).
 
-Constants
----------
-SESSION_SECS    : seconds of webcam footage collected per check (default 5)
-MATCH_THRESHOLD : Mahalanobis distance below which identity is confirmed (default 5.0)
-PROFILE_FILE    : path to the saved gaze profile (cascaded_auth/gaze_profile.joblib)
+How it works:
+-------------
+1. On verification trigger, the webcam captures frames across a short session (3 s).
+2. For each frame, InsightFace detects the face and extracts a 512-D ArcFace embedding.
+3. The session embeddings are averaged to form a session centroid.
+4. Cosine distance between session centroid and enrolled face embedding is computed:
+     distance < MATCH_THRESHOLD (0.50)  → Identity Confirmed (PASS)
+     distance >= MATCH_THRESHOLD (0.50) → Impostor Detected (FAIL)
+5. If no face is detected (e.g. camera covered or user stepped away), verification
+   fails closed to prevent unauthorized access.
 
-Functions
----------
-get_gaze_vector(face_landmarks, frame_w, frame_h) -> np.ndarray (4,)
-collect_gaze_vectors(duration_secs)               -> list[np.ndarray]
-save_gaze_profile(vectors)                        -> None
-run_cv_check()                                    -> bool
+Backward Compatibility:
+-----------------------
+Maintains all legacy function aliases (collect_gaze_vectors, save_gaze_profile,
+get_gaze_vector, PROFILE_FILE) so existing scripts and callers continue to work.
 """
 
+from __future__ import annotations
+
 import os
+import io
 import time
+import base64
 import logging
+from typing import Optional, List, Tuple
 
 import cv2
 import numpy as np
 import joblib
 
-try:
-    import mediapipe as mp
-    _MP_AVAILABLE = True
-except ImportError:
-    _MP_AVAILABLE = False
-    logging.getLogger(__name__).warning(
-        "mediapipe not installed — cv_check will always return True (fail-open)."
-    )
-
-try:
-    from scipy.spatial.distance import mahalanobis
-    _SCIPY_AVAILABLE = True
-except ImportError:
-    _SCIPY_AVAILABLE = False
-    logging.getLogger(__name__).warning(
-        "scipy not installed — using Euclidean fallback."
-    )
-
 log = logging.getLogger(__name__)
 
 # ── File paths ────────────────────────────────────────────────────────────────
-_HERE        = os.path.dirname(os.path.abspath(__file__))
-PROFILE_FILE = os.path.join(_HERE, "gaze_profile.joblib")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+FACE_PROFILE_FILE   = os.path.join(_HERE, "face_profile.joblib")
+GAZE_PROFILE_FILE   = os.path.join(_HERE, "gaze_profile.joblib")
+DATA_PROFILE_FILE   = os.path.join(os.path.dirname(_HERE), "data", "gaze_profile.npy")
 
-# ── Constants ──────────────────────────────────────────────────────────────────────────
-SESSION_SECS    = 5      # capture 5 s of webcam for better frame count
-MATCH_THRESHOLD = 5.0    # Mahalanobis distance threshold — raised to reduce false rejections
+# Legacy symbol for existing callers
+PROFILE_FILE        = FACE_PROFILE_FILE
 
-# MediaPipe FaceMesh iris landmark indices
-# Left iris:  468-472  Right iris: 473-477
-# Left outer corner: 33   Right outer corner: 263
-_LEFT_IRIS  = list(range(468, 473))
-_RIGHT_IRIS = list(range(473, 478))
-_LEFT_CORNER  = 33
-_RIGHT_CORNER = 263
+# ── Verification Constants ───────────────────────────────────────────────────
+SESSION_SECS: float    = 3.0    # Duration of webcam check
+MATCH_THRESHOLD: float = 0.50   # ArcFace Cosine distance threshold (lower = stricter)
+FACE_MODEL: str        = "ArcFace (InsightFace buffalo_sc 512-D)"
+
+# ── Lazy InsightFace loader ───────────────────────────────────────────────────
+_app = None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Gaze vector extraction
-# ══════════════════════════════════════════════════════════════════════════════
+def _get_insightface_app():
+    global _app
+    if _app is None:
+        try:
+            import insightface
+            app = insightface.app.FaceAnalysis(
+                name="buffalo_sc",
+                providers=["CPUExecutionProvider"],
+            )
+            app.prepare(ctx_id=0, det_size=(640, 640))
+            _app = app
+            log.info("InsightFace FaceAnalysis ready (%s).", FACE_MODEL)
+        except Exception as exc:
+            log.error("Failed to initialize InsightFace: %s", exc)
+            _app = None
+    return _app
 
-def get_gaze_vector(face_landmarks, frame_w: int, frame_h: int) -> np.ndarray:
+
+# ── Core Face Embedding Extraction ───────────────────────────────────────────
+
+def extract_face_embedding(frame_bgr: np.ndarray) -> Optional[np.ndarray]:
     """
-    Compute a normalised 4-D gaze vector from MediaPipe FaceMesh landmarks.
+    Detect the most prominent face in a BGR frame and return its 512-D ArcFace embedding.
+    Returns None if no face is detected or if an error occurs.
+    """
+    app = _get_insightface_app()
+    if app is None:
+        return None
+    try:
+        faces = app.get(frame_bgr)
+        if not faces:
+            return None
+        # Choose the face with the largest bounding-box area
+        best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        emb = np.array(best.embedding, dtype=np.float64)
+        if np.linalg.norm(emb) < 1e-6:
+            return None
+        return emb
+    except Exception as exc:
+        log.debug("extract_face_embedding error: %s", exc)
+        return None
 
-    The vector is the offset of each iris centre relative to its eye outer
-    corner, normalised by the inter-ocular distance (IOD):
 
-        [left_iris_offset_x, left_iris_offset_y,
-         right_iris_offset_x, right_iris_offset_y]
+def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Compute Cosine distance in [0, 2].
+    0.0 = identical direction vectors, 1.0 = orthogonal, 2.0 = opposite.
+    """
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na < 1e-10 or nb < 1e-10:
+        return 2.0
+    return float(1.0 - np.dot(a / na, b / nb))
 
-    Normalising by IOD makes the vector robust to head distance from camera.
 
-    Parameters
-    ----------
-    face_landmarks : mediapipe face landmarks object
-    frame_w, frame_h : pixel dimensions of the frame
+def _frame_to_b64(frame: np.ndarray) -> Optional[str]:
+    """Convert BGR frame to Base64 JPEG string for Streamlit dashboard rendering."""
+    if frame is None:
+        return None
+    try:
+        from PIL import Image
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        buf = io.BytesIO()
+        Image.fromarray(rgb).save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
 
+
+# ── Face Capture & Session Verification ──────────────────────────────────────
+
+def collect_face_embeddings(
+    duration_secs: float = SESSION_SECS,
+    fps: float = 6.0,
+    camera_index: int = 0,
+) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
+    """
+    Open the webcam and capture face embeddings over `duration_secs`.
+    
     Returns
     -------
-    np.ndarray of shape (4,)
+    (embeddings, best_frame):
+      - embeddings: list of 512-D numpy vectors
+      - best_frame: raw BGR frame from the first detected face (for dashboard snapshot)
     """
-    lm = face_landmarks.landmark
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        log.error("Cannot open webcam index %d", camera_index)
+        return [], None
 
-    def _px(idx):
-        return np.array([lm[idx].x * frame_w, lm[idx].y * frame_h])
+    embeddings: List[np.ndarray] = []
+    best_frame: Optional[np.ndarray] = None
+    deadline = time.time() + duration_secs
+    frame_interval = 1.0 / max(fps, 1.0)
+    next_frame_time = time.time()
 
-    left_iris  = np.mean([_px(i) for i in _LEFT_IRIS],  axis=0)
-    right_iris = np.mean([_px(i) for i in _RIGHT_IRIS], axis=0)
+    try:
+        # Warmup sensor
+        for _ in range(3):
+            cap.read()
 
-    left_corner  = _px(_LEFT_CORNER)
-    right_corner = _px(_RIGHT_CORNER)
+        while time.time() < deadline:
+            now = time.time()
+            if now < next_frame_time:
+                time.sleep(max(0.0, next_frame_time - now))
+            next_frame_time += frame_interval
 
-    iod = float(np.linalg.norm(right_corner - left_corner)) + 1e-6
-
-    vec = np.concatenate([
-        (left_iris  - left_corner)  / iod,
-        (right_iris - right_corner) / iod,
-    ])
-    return vec   # shape (4,)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Data collection
-# ══════════════════════════════════════════════════════════════════════════════
-
-def collect_gaze_vectors(duration_secs: float = SESSION_SECS) -> list[np.ndarray]:
-    """
-    Open the webcam and collect gaze vectors for duration_secs seconds.
-
-    Returns
-    -------
-    list of np.ndarray (4,) — one per frame where a face was detected.
-    Empty list if mediapipe is unavailable or no face found.
-    """
-    if not _MP_AVAILABLE:
-        log.warning("mediapipe not available — returning empty gaze vectors.")
-        return []
-
-    mp_face = mp.solutions.face_mesh
-    cap     = cv2.VideoCapture(0)
-    vectors = []
-    end     = time.time() + duration_secs
-
-    with mp_face.FaceMesh(refine_landmarks=True, max_num_faces=1) as mesh:
-        while time.time() < end:
             ok, frame = cap.read()
             if not ok:
                 continue
-            h, w = frame.shape[:2]
-            rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = mesh.process(rgb)
-            if result.multi_face_landmarks:
-                try:
-                    vec = get_gaze_vector(result.multi_face_landmarks[0], w, h)
-                    vectors.append(vec)
-                except Exception as exc:
-                    log.debug("Gaze vector extraction failed: %s", exc)
 
-    cap.release()
-    log.info("Collected %d gaze vectors over %.1f s", len(vectors), duration_secs)
-    return vectors
+            emb = extract_face_embedding(frame)
+            if emb is not None:
+                embeddings.append(emb)
+                if best_frame is None:
+                    best_frame = frame.copy()
+
+    finally:
+        cap.release()
+
+    log.info("Collected %d face embeddings over %.1f s", len(embeddings), duration_secs)
+    return embeddings, best_frame
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Profile persistence
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Profile Persistence ──────────────────────────────────────────────────────
 
-def save_gaze_profile(vectors: list[np.ndarray]) -> None:
+def save_face_profile(embeddings: List[np.ndarray]) -> bool:
     """
-    Compute and save the gaze profile (mean + covariance) to PROFILE_FILE.
-
-    Parameters
-    ----------
-    vectors : list of np.ndarray (4,)
-        Gaze vectors collected during enrolment.
+    Compute and save the enrolled face profile to FACE_PROFILE_FILE and GAZE_PROFILE_FILE.
     """
-    if not vectors:
-        log.error("No gaze vectors provided — profile not saved.")
-        return
+    if not embeddings:
+        log.error("No face embeddings provided — profile not saved.")
+        return False
 
-    mat     = np.array(vectors, dtype=np.float64)
+    mat = np.array(embeddings, dtype=np.float64)
+    face_mean = np.mean(mat, axis=0)
+    face_std  = np.std(mat, axis=0)
+
     profile = {
-        "mean": np.mean(mat, axis=0),
-        "cov":  np.cov(mat.T),
-        "n":    len(vectors),
+        "face_mean":       face_mean,
+        "face_std":        face_std,
+        "face_embeddings": embeddings,
+        "model":           FACE_MODEL,
+        "n_frames":        len(embeddings),
+        "threshold":       MATCH_THRESHOLD,
+        "timestamp":       time.time(),
     }
-    joblib.dump(profile, PROFILE_FILE)
-    print(f"Gaze profile saved ({len(vectors)} samples) → {PROFILE_FILE}")
+
+    # Save to primary v2 face profile
+    joblib.dump(profile, FACE_PROFILE_FILE)
+    log.info("Face profile saved (%d frames) → %s", len(embeddings), FACE_PROFILE_FILE)
+
+    # Also sync to GAZE_PROFILE_FILE so older checks find an enrolled profile
+    try:
+        joblib.dump(profile, GAZE_PROFILE_FILE)
+    except Exception:
+        pass
+
+    return True
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Live check
-# ══════════════════════════════════════════════════════════════════════════════
+def load_enrolled_profile() -> Tuple[Optional[dict], str]:
+    """
+    Load enrolled profile from disk.
+    Checks FACE_PROFILE_FILE, then GAZE_PROFILE_FILE, then DATA_PROFILE_FILE.
+    
+    Returns (profile_dict, mode) where mode is 'face' or 'legacy_gaze'.
+    """
+    for path in (FACE_PROFILE_FILE, GAZE_PROFILE_FILE):
+        if os.path.exists(path):
+            try:
+                data = joblib.load(path)
+                if isinstance(data, dict):
+                    if "face_mean" in data:
+                        return data, "face"
+                    elif "mean" in data and "cov" in data:
+                        return data, "legacy_gaze"
+            except Exception as exc:
+                log.warning("Could not read profile at %s: %s", path, exc)
+
+    if os.path.exists(DATA_PROFILE_FILE):
+        try:
+            data = np.load(DATA_PROFILE_FILE, allow_pickle=True).item()
+            if isinstance(data, dict) and "face_mean" in data:
+                return data, "face"
+        except Exception as exc:
+            log.warning("Could not read %s: %s", DATA_PROFILE_FILE, exc)
+
+    return None, "none"
+
+
+# ── Complete Verification Session ────────────────────────────────────────────
+
+def verify_face_session(
+    duration_secs: float = SESSION_SECS,
+    camera_index: int = 0,
+) -> dict:
+    """
+    Run a complete identity check session:
+      1. Load enrolled face profile
+      2. Capture face embeddings from webcam
+      3. Compare cosine distance to enrolled centroid
+      4. Return detailed verification result dict
+    """
+    profile, mode = load_enrolled_profile()
+    if profile is None:
+        log.warning("No face profile found on disk — please enrol first.")
+        return {
+            "error": "No face profile found. Complete Enrolment first.",
+            "match": False,
+            "combined": None,
+            "face_dist": None,
+            "gaze_dist": None,
+            "geom_dist": None,
+            "threshold": MATCH_THRESHOLD,
+            "n_frames": 0,
+            "timestamp": time.time(),
+            "snapshot_b64": None,
+        }
+
+    # Open webcam and collect embeddings
+    embeddings, best_frame = collect_face_embeddings(
+        duration_secs=duration_secs,
+        fps=6.0,
+        camera_index=camera_index,
+    )
+    snapshot_b64 = _frame_to_b64(best_frame) if best_frame is not None else None
+
+    # Fail closed if no face detected in camera
+    if not embeddings:
+        log.warning("CV check: no face detected — failing closed (intruder or camera blocked).")
+        return {
+            "error": "No face detected in camera",
+            "match": False,
+            "combined": 2.0,
+            "face_dist": 2.0,
+            "gaze_dist": 2.0,
+            "geom_dist": None,
+            "threshold": MATCH_THRESHOLD,
+            "n_frames": 0,
+            "timestamp": time.time(),
+            "snapshot_b64": snapshot_b64,
+        }
+
+    if mode == "face":
+        session_mean = np.mean(embeddings, axis=0)
+        enrolled_mean = np.asarray(profile["face_mean"], dtype=np.float64)
+        dist = cosine_distance(session_mean, enrolled_mean)
+        thr = float(profile.get("threshold", MATCH_THRESHOLD))
+        match = dist < thr
+
+        log.info("Face check: dist=%.4f (thr=%.2f) match=%s [%d frames]", dist, thr, match, len(embeddings))
+        return {
+            "match":        bool(match),
+            "combined":     round(dist, 4),
+            "face_dist":    round(dist, 4),
+            "gaze_dist":    round(dist, 4),   # alias for backward-compatible table views
+            "geom_dist":    None,
+            "threshold":    thr,
+            "n_frames":     len(embeddings),
+            "timestamp":    time.time(),
+            "snapshot_b64": snapshot_b64,
+            "error":        None,
+        }
+
+    else:
+        # Fallback for legacy gaze profiles with 'mean' and 'cov'
+        log.warning("Using legacy gaze profile fallback.")
+        return {
+            "match": False,
+            "combined": 2.0,
+            "face_dist": 2.0,
+            "gaze_dist": 2.0,
+            "geom_dist": None,
+            "threshold": MATCH_THRESHOLD,
+            "n_frames": len(embeddings),
+            "timestamp": time.time(),
+            "snapshot_b64": snapshot_b64,
+            "error": "Profile format requires re-enrolment with Face Capture",
+        }
+
 
 def run_cv_check() -> bool:
     """
-    Capture a short webcam session and compare against the enrolled gaze profile.
+    Capture a short webcam session and compare against the enrolled face profile.
+    Used by cascaded_auth/monitor.py.
 
     Returns
     -------
-    True  — identity confirmed (Mahalanobis distance < MATCH_THRESHOLD)
-    False — no match or no face detected
+    True  — identity confirmed
+    False — impostor / mismatch or no face detected
     """
-    if not os.path.exists(PROFILE_FILE):
-        print("No gaze profile found. Run enrol.py first.")
-        return True   # fail-open: don't lock out if not enrolled
+    result = verify_face_session(duration_secs=SESSION_SECS)
+    return bool(result.get("match", False))
 
-    try:
-        profile = joblib.load(PROFILE_FILE)
-    except Exception as exc:
-        log.error("Failed to load gaze profile: %s", exc)
-        return True
 
-    vectors = collect_gaze_vectors(SESSION_SECS)
-    if not vectors:
-        # Fail-open: if no face detected (bad lighting, camera issue, etc.)
-        # do NOT lock out the owner. Log a warning and confirm identity.
-        log.warning("CV check: no face detected — failing open (owner assumed present).")
-        print("CV: no face detected — failing open")
-        return True
+# ── Backward Compatibility Aliases ───────────────────────────────────────────
 
-    session_vec = np.mean(np.array(vectors, dtype=np.float64), axis=0)
+def collect_gaze_vectors(duration_secs: float = SESSION_SECS) -> list:
+    """Legacy alias for collect_face_embeddings."""
+    embs, _ = collect_face_embeddings(duration_secs=duration_secs)
+    return embs
 
-    # ── Mahalanobis distance ──────────────────────────────────────────────────
-    try:
-        cov     = profile["cov"]
-        cov_inv = np.linalg.inv(cov)
-    except np.linalg.LinAlgError:
-        log.warning("Covariance matrix singular — using identity.")
-        cov_inv = np.eye(len(session_vec))
 
-    if _SCIPY_AVAILABLE:
-        dist = float(mahalanobis(session_vec, profile["mean"], cov_inv))
-    else:
-        # Euclidean fallback (less reliable but avoids hard dependency)
-        diff = session_vec - profile["mean"]
-        dist = float(np.sqrt(diff @ diff))
+def save_gaze_profile(vectors: list) -> None:
+    """Legacy alias for save_face_profile."""
+    save_face_profile(vectors)
 
-    match = dist < MATCH_THRESHOLD
-    print(f"CV check: dist={dist:.3f}  threshold={MATCH_THRESHOLD}  match={match}")
-    return match
+
+def get_gaze_vector(face_landmarks, frame_w: int, frame_h: int) -> np.ndarray:
+    """Legacy stub in case an external caller references get_gaze_vector."""
+    return np.zeros(4, dtype=np.float64)

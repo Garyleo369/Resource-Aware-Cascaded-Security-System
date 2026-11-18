@@ -1,171 +1,103 @@
-# Two-Tier Cascaded Continuous Authentication — Prototype
+# Resource-Aware Cascaded Continuous Authentication
 
-A feasibility prototype for a **continuous biometric authentication** system that combines:
+**A two-tier behavioral authentication research prototype**
 
-| Tier | Modality | Technology | Trigger |
-|------|----------|-----------|---------|
-| **Tier 1** | Keystroke Dynamics (KSD) | IsolationForest anomaly detection | Always-on |
-| **Tier 2** | Computer Vision (CV) | Mediapipe FaceMesh + Mahalanobis distance | On-demand (fired by Tier 1) |
+A prototype that continuously analyzes keystroke dynamics and activates a webcam-based verification stage only when typing behavior appears anomalous. The goal is to explore whether a lightweight always-on signal can reduce unnecessary computer-vision processing.
 
----
+**Stack:** Python · scikit-learn · MediaPipe · OpenCV · Streamlit · pynput
 
-## Project Structure
+## Problem
 
+A one-time login cannot establish that the same person remains at a workstation. Continuous camera-based verification may consume resources and raise usability concerns. This project investigates a staged approach that escalates verification only when the first signal indicates unusual behavior.
+
+## System overview
+
+```text
+Keyboard events
+     |
+     v
+Dwell and flight time features
+     |
+     v
+Isolation Forest anomaly scoring
+     |
+     +---- normal behavior ---> continue monitoring
+     |
+     +---- anomaly ----------> trigger camera session
+                                  |
+                                  v
+                           MediaPipe FaceMesh
+                                  |
+                                  v
+                        Gaze / facial geometry
+                                  |
+                                  v
+                         Profile comparison
+                                  |
+                                  v
+                           Verification result
 ```
-prototype/
-├── main.py           # Entry point — launches all threads
-├── enrol.py          # One-time setup script
-├── dashboard.py      # Streamlit live monitor
-├── requirements.txt
-│
-├── ksd/
-│   ├── listener.py   # pynput keyboard event logging
-│   ├── features.py   # 14-D keystroke feature vector extraction
-│   ├── model.py      # IsolationForest scoring wrapper
-│   └── threshold.py  # Rolling dynamic threshold (mean + 1.5σ)
-│
-├── cv/
-│   ├── session.py    # Webcam + FaceMesh capture session
-│   ├── gaze.py       # Iris tracking + session statistics
-│   ├── geometry.py   # Facial ratio extraction + statistics
-│   └── matcher.py    # Mahalanobis distance matcher
-│
-└── data/             # Auto-generated
-    ├── model.joblib  # Trained IsolationForest
-    └── gaze_profile.npy  # Enrolled gaze mean + covariance
-```
 
----
+## Key components
 
-## Setup
+| Path | Responsibility |
+| --- | --- |
+| `enrol.py` | Capture baseline keyboard and webcam data |
+| `main.py` | Run the authentication pipeline |
+| `dashboard.py` | Streamlit monitoring interface |
+| `ksd/listener.py` | Capture keyboard timing events |
+| `ksd/features.py` | Extract dwell, flight and digraph features |
+| `ksd/model.py` | Score typing patterns with Isolation Forest |
+| `ksd/threshold.py` | Manage rolling anomaly thresholds |
+| `cv/session.py` | Capture triggered camera sessions |
+| `cv/gaze.py` | Extract gaze-related signals |
+| `cv/geometry.py` | Extract facial geometry features |
+| `cv/matcher.py` | Compare captured features with the enrolled profile |
 
-### 1. Install dependencies
+## Technical approach
+
+### Tier 1 — Keystroke dynamics
+
+The system builds a 14-dimensional feature representation from typing windows: summary statistics of dwell and flight times, plus selected digraph timing features. Isolation Forest provides anomaly scores without requiring a labeled dataset of every possible impostor. A rolling threshold determines when to escalate.
+
+### Tier 2 — Camera verification
+
+A triggered camera session uses MediaPipe facial landmarks to derive gaze and facial geometry features. The matcher compares session-level features with the enrolled baseline. The two tiers are intentionally separate so the more expensive stage does not need to run continuously.
+
+## Run locally
+
+**Prerequisites:** Python, a keyboard and a webcam.
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 2. Enrol (one-time)
-
-```bash
 python enrol.py
-```
-
-This runs two concurrent tasks:
-
-- **Keyboard**: Type naturally in any application. Press `Esc` when done.
-  Requires ≥ 500 keystrokes (10 × 50-key windows) for a good model.
-- **Webcam**: Automatically captures 30 seconds of gaze data. Look naturally
-  at the screen. A preview window will open.
-
-Artefacts saved to `data/`:
-- `data/model.joblib` — trained IsolationForest
-- `data/gaze_profile.npy` — gaze mean vector + covariance matrix
-
----
-
-## Running
-
-### Authentication system (headless)
-
-```bash
 python main.py
 ```
 
-Press **Ctrl+C** to stop.
-
-### Live dashboard
+For the monitoring dashboard, run in a separate terminal:
 
 ```bash
 streamlit run dashboard.py
 ```
 
-Opens at `http://localhost:8501`.
+The original setup expects a substantial keyboard enrollment sample and a short webcam baseline session. Consult the code and on-screen prompts for current enrollment requirements.
 
----
+## Suggested interview demo
 
-## Architecture Details
+1. Enroll a baseline user.
+2. Start monitoring and show normal typing scores.
+3. Introduce a deliberate change in typing rhythm.
+4. Observe whether the anomaly threshold is crossed.
+5. Show the triggered webcam verification stage and resulting status.
 
-### Tier 1 — Keystroke Dynamics
+> Add an actual screenshot from `screenshots/` and a short screen recording here after checking that no sensitive biometric data or private keystrokes are exposed.
 
-```
-pynput Listener → raw event queue
-    ↓
-Feature extraction (14-D vector):
-  • Dwell time  stats [mean, std, p10, p50, p90]
-  • Flight time stats [mean, std, p10, p50, p90]
-  • Top-4 digraph mean flight times
-    ↓
-IsolationForest.score_samples() → normalise to [0,1]
-    ↓
-Rolling window (n=20) → threshold = mean + 1.5σ
-    ↓
-score > threshold → SET cv_trigger Event
-```
+## Evaluation and limitations
 
-### Tier 2 — Computer Vision
+See [PROJECT_REPORT.md](PROJECT_REPORT.md) and [evaluation_results.json](evaluation_results.json) for the project's evaluation artifacts. Prototype results must be interpreted in the context of the dataset, threshold selection and test protocol; they are not evidence of production-grade security.
 
-```
-WAIT on cv_trigger Event (sleep state)
-    ↓ triggered
-Capture 3 s × 15 fps webcam frames
-    ↓
-Mediapipe FaceMesh (refine_landmarks=True)
-    ↓
-Per-frame extraction:
-  • Gaze vector    [gx, gy, iod_ratio]       (iris landmarks)
-  • Geometry vector [iod_norm, nose_chin, lip_curve]
-    ↓
-Session mean gaze + geometry
-    ↓
-Mahalanobis distance vs enrolled profile
-    ↓
-Combined = 0.65 × gaze_dist + 0.35 × geom_dist
-    ↓
-match = combined < 3.5
-```
+The repository's earlier technical notes also identify limitations including geometry matching that uses a proxy distance rather than a fully enrolled geometry distribution. Camera availability, environmental conditions, enrollment drift and false positives remain important concerns.
 
-### Thread Management
+## Responsible use
 
-```
-main.py
-  ├── threading.Event()   cv_trigger
-  ├── queue.Queue()       result_queue
-  ├── threading.Event()   stop_event
-  │
-  ├── Thread("KSD-Tier1", daemon=True)  → ksd_thread_fn()
-  ├── Thread("CV-Tier2",  daemon=True)  → cv_thread_fn()
-  └── Main thread → consume_results()  [blocks until Ctrl-C]
-```
-
----
-
-## Feature Vector Reference
-
-| Index | Feature | Unit |
-|-------|---------|------|
-| 0 | Dwell mean | ms |
-| 1 | Dwell std | ms |
-| 2 | Dwell p10 | ms |
-| 3 | Dwell p50 | ms |
-| 4 | Dwell p90 | ms |
-| 5 | Flight mean | ms |
-| 6 | Flight std | ms |
-| 7 | Flight p10 | ms |
-| 8 | Flight p50 | ms |
-| 9 | Flight p90 | ms |
-| 10-13 | Top-4 digraph mean flight times | ms |
-
----
-
-## Notes & Known Limitations
-
-- **Webcam index**: defaults to `0`. Change `camera_index` in `main.py` if
-  your webcam is on a different index.
-- **Geometry matching**: The CV geometry component uses a proxy Euclidean
-  distance since geometry is not separately enrolled. For production, enrol
-  geometry ratios alongside gaze vectors.
-- **Permissions**: `pynput` requires elevated permissions or Accessibility
-  access on macOS; on Windows it works without elevation.
-- **Threshold cold start**: The dynamic threshold requires ≥ 2 KSD windows
-  before it becomes active (returns `None` until then).
+This is an experimental authentication system, not a replacement for established authentication controls. Keyboard and facial measurements are sensitive. Obtain informed consent, minimize retention and avoid uploading raw personal biometric samples to public repositories.
